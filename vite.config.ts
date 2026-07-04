@@ -195,7 +195,7 @@ export default defineConfig(({ mode }) => {
       setupFiles: "./tests/setup.ts",
     },
     root: "./",
-    base: "/",
+    base: isProduction ? "/openfront/" : "/",
     publicDir: isProduction ? false : "resources",
 
     resolve: {
