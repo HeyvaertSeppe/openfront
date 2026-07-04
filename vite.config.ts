@@ -20,6 +20,7 @@ import {
   writePublicAssetManifest,
 } from "./src/server/PublicAssetManifest";
 
+// Vite already handles these, but its good practice to define them explicitly
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -30,6 +31,8 @@ function serveProprietaryDir(
   return {
     name: "serve-proprietary-dir",
     configureServer(server) {
+      // Must run before Vite's htmlFallback; skip when resources/ has the file
+      // so publicDir keeps precedence.
       server.middlewares.use((req, res, next) => {
         if (!req.url) return next();
         const rel = decodeURIComponent(
@@ -49,6 +52,10 @@ function serveProprietaryDir(
   };
 }
 
+// Dev-only stand-in for the nginx random-worker routing (the openfront_workers
+// upstream). Forwards these prefix-less POSTs to a randomly chosen worker port
+// so the worker can mint a self-owned id. Runs as direct middleware (before
+// vite's /api proxy).
 const RANDOM_WORKER_PATHS = ["/api/create_game", "/api/adminbot/create_game"];
 function randomWorkerCreateProxy(numWorkers: number): Plugin {
   return {
@@ -93,17 +100,6 @@ export default defineConfig(({ mode }) => {
     ? buildPublicAssetManifest(sourceDirs)
     : {};
   const cdnBase = env.CDN_BASE ?? "";
-
-  // In production, use Render backend URL for WebSocket connections
-  const wsUrl = isProduction
-    ? (env.VITE_WS_BASE_URL ?? "openfront-web.onrender.com")
-    : "localhost:3000";
-
-  // In production, use Render backend URL for API calls
-  const apiDomain = isProduction
-    ? (env.VITE_API_BASE_URL ?? "https://openfront-web.onrender.com")
-    : (env.API_DOMAIN ?? "");
-
   const htmlAssetData = {
     assetManifest: JSON.stringify(assetManifest),
     cdnBase: JSON.stringify(cdnBase),
@@ -134,6 +130,11 @@ export default defineConfig(({ mode }) => {
     mobileLogoImageUrl: buildAssetUrl("images/OF.png", assetManifest, cdnBase),
   };
 
+  // Vite's HTML transform replaces the source <script src="/src/client/Main.ts">
+  // with the hashed bundle URL and injects <link rel="modulepreload"> /
+  // <link rel="stylesheet"> tags. rewriteAssetsForCdn rewrites those refs to
+  // an EJS placeholder so RenderHtml.ts can prefix them with CDN_BASE at
+  // request time.
   const injectCdnBaseTemplate = (): Plugin => ({
     name: "inject-cdn-base-template",
     apply: "build" as const,
@@ -151,7 +152,15 @@ export default defineConfig(({ mode }) => {
     closeBundle() {
       const outDir = path.join(__dirname, "static");
       copyRootPublicFiles(resourcesDir, outDir);
+      // Run the source→hashed copy first; createHashedPublicAssetFiles iterates
+      // assetManifest and expects every key to resolve to a file in resources/
+      // or proprietary/. Vite's bundle output (assets/...) doesn't, so it's
+      // merged in after.
       createHashedPublicAssetFiles(sourceDirs, outDir, assetManifest);
+      // Track Vite's own bundle output (vendor chunks, JS, CSS, workers under
+      // static/assets/) in the manifest so the deploy-time R2 upload covers
+      // them alongside the hashed source assets. Skip non-assets/ emits like
+      // index.html — those are served by the app, not from R2.
       for (const fileName of viteBundleFiles) {
         if (!fileName.startsWith("assets/")) continue;
         assetManifest[fileName] = `/${fileName}`;
@@ -160,6 +169,7 @@ export default defineConfig(({ mode }) => {
     },
   });
 
+  // In dev, redirect visits to /w*/game/* to "/" so Vite serves the index.html.
   const devGameHtmlBypass = (req?: {
     url?: string;
     method?: string;
@@ -185,7 +195,7 @@ export default defineConfig(({ mode }) => {
       setupFiles: "./tests/setup.ts",
     },
     root: "./",
-    base: isProduction ? "/openfront/" : "/",
+    base: "/",
     publicDir: isProduction ? false : "resources",
 
     resolve: {
@@ -225,18 +235,21 @@ export default defineConfig(({ mode }) => {
 
     define: {
       __ASSET_MANIFEST__: JSON.stringify(assetManifest),
-      "process.env.WEBSOCKET_URL": JSON.stringify(wsUrl),
+      "process.env.WEBSOCKET_URL": JSON.stringify(
+        isProduction ? "" : "localhost:3000",
+      ),
       "process.env.GAME_ENV": JSON.stringify(isProduction ? "prod" : "dev"),
       "process.env.STRIPE_PUBLISHABLE_KEY": JSON.stringify(
         env.STRIPE_PUBLISHABLE_KEY,
       ),
-      "process.env.API_DOMAIN": JSON.stringify(apiDomain),
+      "process.env.API_DOMAIN": JSON.stringify(env.API_DOMAIN),
+      // Add other process.env variables if needed, OR migrate code to import.meta.env
     },
 
     build: {
-      outDir: "static",
+      outDir: "static", // Webpack outputs to 'static', assuming we want to keep this.
       emptyOutDir: true,
-      assetsDir: "assets",
+      assetsDir: "assets", // Sub-directory for assets
       rollupOptions: {
         output: {
           manualChunks: (id) => {
@@ -252,6 +265,7 @@ export default defineConfig(({ mode }) => {
     server: {
       port: 9000,
       host: process.env.VITE_HOST === "lan",
+      // Automatically open the browser when the server starts
       open: process.env.SKIP_BROWSER_OPEN !== "true",
       proxy: {
         "/lobbies": {
@@ -259,6 +273,7 @@ export default defineConfig(({ mode }) => {
           ws: true,
           changeOrigin: true,
         },
+        // Worker proxies
         "/w0": {
           target: "ws://localhost:3001",
           ws: true,
@@ -275,6 +290,7 @@ export default defineConfig(({ mode }) => {
           bypass: (req) => devGameHtmlBypass(req),
           rewrite: (path) => path.replace(/^\/w1/, ""),
         },
+        // API proxies
         "/api": {
           target: "http://localhost:3000",
           changeOrigin: true,
